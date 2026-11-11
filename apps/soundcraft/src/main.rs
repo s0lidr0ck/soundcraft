@@ -229,6 +229,9 @@ fn main() -> eframe::Result {
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
             .with_app_id("ai.storyteller.soundcraft"),
+        // Cmd/Ctrl+X/C/V arrive as keys, for Edit › Cut, Copy and Paste on clips; text fields get
+        // them back as clipboard events from `shortcuts::clipboard_keys` (#1473).
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     if let Some(icon) = app_icon() {

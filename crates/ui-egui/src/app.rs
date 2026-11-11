@@ -321,6 +321,7 @@ impl SoundApp {
         // `DragValue` and text completion), so checking afterwards would see them missing, leave
         // the batch pending, and inject the same edit/navigation/cut again next frame.
         let received_synthetic = self.pass_received_synthetic(&ctx);
+        shortcuts::clipboard_keys(&ctx);
         shortcuts::handle(self, &ctx);
         self.sample_drop_targets.clear();
         if !self.native_menu_bar {

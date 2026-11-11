@@ -54,6 +54,73 @@ fn search_chord(m: Modifiers, mac: bool) -> bool {
     mac && m.command && m.ctrl
 }
 
+/// What a clipboard chord asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clip {
+    Cut,
+    Copy,
+    Paste,
+}
+
+/// The clipboard request `key` with `m` makes, if any: Cmd/Ctrl+X/C/V, the dedicated Cut/Copy/Paste
+/// keys, and on Windows also Shift+Delete, Ctrl+Insert and Shift+Insert.
+fn clipboard_chord(key: Key, m: Modifiers, windows: bool) -> Option<Clip> {
+    match key {
+        Key::Cut => Some(Clip::Cut),
+        Key::Copy => Some(Clip::Copy),
+        Key::Paste => Some(Clip::Paste),
+        Key::X if m.command_only() => Some(Clip::Cut),
+        Key::C if m.command_only() => Some(Clip::Copy),
+        Key::V if m.command_only() => Some(Clip::Paste),
+        Key::Delete if windows && m.shift => Some(Clip::Cut),
+        Key::Insert if windows && m.ctrl => Some(Clip::Copy),
+        Key::Insert if windows && m.shift => Some(Clip::Paste),
+        _ => None,
+    }
+}
+
+/// Give this pass's clipboard chords to the widget that wants the keyboard. Call it once per
+/// viewport pass, before any widget.
+///
+/// The native shell turns `clipboard_shortcuts` off, so Cmd/Ctrl+X/C/V arrive as ordinary key
+/// presses and [`handle`] runs Edit › Cut, Copy and Paste on clips (#1473): left on, the window
+/// layer swallowed them into clipboard events no shortcut reads, and dropped a paste whenever the
+/// system clipboard held no text. Text fields listen for those clipboard events, so while one is
+/// focused a chord becomes the event again (a paste asks the window for the clipboard's text,
+/// which arrives in the next pass). With no field focused a copy is also offered to selected
+/// label text. The browser sends its own clipboard events, so the web build does nothing here.
+pub fn clipboard_keys(ctx: &egui::Context) {
+    if cfg!(target_arch = "wasm32") {
+        return;
+    }
+    let editing = ctx.egui_wants_keyboard_input();
+    let windows = ctx.os() == egui::os::OperatingSystem::Windows;
+    let paste = ctx.input_mut(|i| {
+        let mut paste = false;
+        let mut copy = false;
+        for e in &mut i.events {
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = e else { continue };
+            match clipboard_chord(*key, *modifiers, windows) {
+                // Replaced in place: the field must not also see the key (Shift+Delete would
+                // delete a character as well), and the other events keep their positions.
+                Some(Clip::Cut) if editing => *e = egui::Event::Cut,
+                Some(Clip::Copy) if editing => *e = egui::Event::Copy,
+                Some(Clip::Paste) if editing => paste = true,
+                Some(Clip::Copy) => copy = true,
+                _ => {}
+            }
+        }
+        if copy {
+            i.events.push(egui::Event::Copy);
+        }
+        paste
+    });
+    if paste {
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        ctx.request_repaint();
+    }
+}
+
 /// Commands a host auto-repeat runs again, so holding a zoom key keeps zooming (#1377). Every other
 /// shortcut ignores auto-repeats (#1063): holding Cmd+Z undoes once. Decided by the command a chord
 /// resolves to, not by its keys.
@@ -507,7 +574,7 @@ mod label_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_for, mods_match, parse, search_chord};
+    use super::{Clip, clipboard_chord, clipboard_keys, command_for, mods_match, parse, search_chord};
     use egui::{Key, Modifiers};
 
     /// Ctrl held on Windows or Linux, as egui reports it.
@@ -517,6 +584,83 @@ mod tests {
 
     fn want(s: &str) -> Modifiers {
         parse(s).map(|(m, _)| m).unwrap()
+    }
+
+    #[test]
+    fn clipboard_chords_are_the_platform_ones() {
+        for (key, clip) in [(Key::X, Clip::Cut), (Key::C, Clip::Copy), (Key::V, Clip::Paste)] {
+            assert_eq!(clipboard_chord(key, PC_CTRL, true), Some(clip));
+            assert_eq!(clipboard_chord(key, MAC_CMD, false), Some(clip));
+            assert_eq!(clipboard_chord(key, Modifiers::NONE, true), None, "a bare letter is a single-key command");
+            assert_eq!(clipboard_chord(key, Modifiers { shift: true, ..PC_CTRL }, true), None, "Cmd+Shift+V is Paste Special");
+        }
+        let shift = Modifiers { shift: true, ..Modifiers::NONE };
+        assert_eq!(clipboard_chord(Key::Delete, shift, true), Some(Clip::Cut));
+        assert_eq!(clipboard_chord(Key::Insert, PC_CTRL, true), Some(Clip::Copy));
+        assert_eq!(clipboard_chord(Key::Insert, shift, true), Some(Clip::Paste));
+        assert_eq!(clipboard_chord(Key::Delete, shift, false), None, "Shift+Delete is a Windows chord");
+        assert_eq!(clipboard_chord(Key::Insert, shift, false), None);
+        assert_eq!(clipboard_chord(Key::Copy, Modifiers::NONE, false), Some(Clip::Copy));
+    }
+
+    /// One pass over a focused single-line field holding `text`, with `events` as host input.
+    fn field_pass(ctx: &egui::Context, text: &mut String, events: Vec<egui::Event>) -> Vec<egui::Event> {
+        let mut seen = Vec::new();
+        let input = egui::RawInput { events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            clipboard_keys(ui.ctx());
+            seen = ui.ctx().input(|i| i.events.clone());
+            ui.add(egui::TextEdit::singleline(text)).request_focus();
+        });
+        out.textures_delta.clear();
+        seen
+    }
+
+    fn press(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn a_focused_text_field_gets_clipboard_chords_as_clipboard_events() {
+        let ctx = egui::Context::default();
+        let mut text = String::from("tempo");
+        field_pass(&ctx, &mut text, Vec::new());
+        field_pass(&ctx, &mut text, Vec::new());
+        assert!(ctx.egui_wants_keyboard_input(), "the field is editing");
+        field_pass(&ctx, &mut text, vec![press(Key::A, PC_CTRL)]);
+        // Copy leaves the text; cut removes the selection. Both keys reach the field as events.
+        let seen = field_pass(&ctx, &mut text, vec![press(Key::C, PC_CTRL)]);
+        assert!(matches!(seen.as_slice(), [egui::Event::Copy]), "{seen:?}");
+        assert_eq!(text, "tempo");
+        let seen = field_pass(&ctx, &mut text, vec![press(Key::X, PC_CTRL)]);
+        assert!(matches!(seen.as_slice(), [egui::Event::Cut]), "{seen:?}");
+        assert_eq!(text, "", "Ctrl+X cut the selected text");
+        // A paste keeps its key (the text comes from the window in the next pass).
+        let seen = field_pass(&ctx, &mut text, vec![press(Key::V, PC_CTRL)]);
+        assert!(matches!(seen.as_slice(), [egui::Event::Key { key: Key::V, .. }]), "{seen:?}");
+    }
+
+    #[test]
+    fn without_a_text_field_clipboard_chords_stay_keys_for_the_clip_commands() {
+        let ctx = egui::Context::default();
+        let pass = |events: Vec<egui::Event>| {
+            let mut seen = Vec::new();
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                clipboard_keys(ui.ctx());
+                seen = ui.ctx().input(|i| i.events.clone());
+            });
+            out.textures_delta.clear();
+            seen
+        };
+        for key in [Key::X, Key::V] {
+            let seen = pass(vec![press(key, PC_CTRL)]);
+            assert!(matches!(seen.as_slice(), [egui::Event::Key { key: k, .. }] if *k == key), "{seen:?}");
+            assert_eq!(command_for(key, PC_CTRL, false), Some(if key == Key::X { "edit.cut" } else { "edit.paste" }));
+        }
+        // Copy keeps its key for Edit › Copy and is also offered to selected label text.
+        let seen = pass(vec![press(Key::C, PC_CTRL)]);
+        assert!(matches!(seen.as_slice(), [egui::Event::Key { key: Key::C, .. }, egui::Event::Copy]), "{seen:?}");
+        assert_eq!(command_for(Key::C, PC_CTRL, false), Some("edit.copy"));
     }
 
     #[test]
